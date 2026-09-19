@@ -19,6 +19,7 @@ import {
   DollarSign,
   PlaneTakeoff
 } from "lucide-react";
+import { AiExecutiveSummaryBanner } from "../components/common/AiExecutiveSummaryBanner";
 
 export const FinancePage: React.FC = () => {
   const location = useLocation();
@@ -205,10 +206,13 @@ export const FinancePage: React.FC = () => {
             }`}
           >
             <PlaneTakeoff className="w-3.5 h-3.5" />
-            <span>Staff Leave</span>
+            <span>Leave Requests</span>
           </button>
         </div>
       </div>
+
+      {/* Gemini AI Revenue Realization & Audit Briefing */}
+      <AiExecutiveSummaryBanner role="FINANCE" />
 
       {activeView === "charges" && (
         <Card

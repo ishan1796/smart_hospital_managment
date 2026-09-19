@@ -22,6 +22,7 @@ import {
   Activity,
   Search
 } from "lucide-react";
+import { AiExecutiveSummaryBanner } from "../components/common/AiExecutiveSummaryBanner";
 
 export const HrmsPage: React.FC = () => {
   const [employees, setEmployees] = useState<any[]>([]);
@@ -298,6 +299,9 @@ export const HrmsPage: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* Gemini AI Payroll Liability & Staffing Executive Briefing */}
+      <AiExecutiveSummaryBanner role="HRMS" />
 
       {/* ========================================================= */}
       {/* 1. STAFF ROSTER TAB */}

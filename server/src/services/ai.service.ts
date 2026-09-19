@@ -1,218 +1,415 @@
 import { prisma } from "../config/db";
+import { config } from "../config/env";
 import { AuthUser } from "../types/auth";
 import { ApiError } from "../middleware/errorHandler";
 
 export class AIService {
-  // Authorized Patient Tools
-  private static async executePatientTool(toolName: string, patientId: string): Promise<any> {
-    switch (toolName) {
-      case "getMyAppointments": {
-        return prisma.appointment.findMany({
-          where: { patientId },
-          include: {
-            doctor: { include: { employee: { include: { user: true } }, department: true } },
-            department: true,
-          },
-          orderBy: { appointmentDate: "desc" },
-          take: 5,
-        });
-      }
-      case "getMyPrescriptions": {
-        return prisma.prescription.findMany({
-          where: { patientId },
-          include: {
-            doctor: { include: { employee: { include: { user: true } } } },
-            items: true,
-          },
-          orderBy: { date: "desc" },
-          take: 5,
-        });
-      }
-      case "getMyReports": {
-        return prisma.medicalReport.findMany({
-          where: { patientId },
-          orderBy: { reportDate: "desc" },
-          take: 5,
-        });
-      }
-      case "getMyBills": {
-        return prisma.invoice.findMany({
-          where: { patientId },
-          include: { payments: true },
-          orderBy: { createdAt: "desc" },
-          take: 5,
-        });
-      }
-      case "getHospitalTimings": {
-        return {
-          hospitalName: "AegisCare Super Specialty Hospital",
-          opdTimings: "Monday to Saturday: 8:00 AM - 8:00 PM, Sunday: 9:00 AM - 2:00 PM",
-          emergency: "24/7 Trauma and Emergency Care Center",
-          visitingHours: "4:00 PM - 7:00 PM daily",
-          helpline: "+1 (800) 555-CARE / info@aegiscare.hospital",
-        };
-      }
-      default:
-        return { error: "Unknown tool" };
+  private static async callGemini(systemInstruction: string, userPrompt: string): Promise<string> {
+    const apiKey = config.geminiApiKey;
+    if (!apiKey) {
+      throw new Error("GEMINI_API_KEY is not configured on the server.");
     }
+
+    const models = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-flash-latest"];
+    let lastError: any = null;
+
+    for (const model of models) {
+      try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            system_instruction: { parts: [{ text: systemInstruction }] },
+            contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+            generationConfig: {
+              temperature: 0.3,
+              topP: 0.95,
+              maxOutputTokens: 2048,
+            },
+          }),
+        });
+
+        const data = await response.json();
+        if (data.error) {
+          lastError = new Error(data.error.message || "Gemini API error");
+          continue;
+        }
+
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text) {
+          return text;
+        }
+      } catch (err: any) {
+        lastError = err;
+      }
+    }
+
+    throw lastError || new Error("Failed to get response from Gemini AI.");
   }
 
-  // Authorized Admin Tools
-  private static async executeAdminTool(toolName: string): Promise<any> {
-    switch (toolName) {
-      case "getExecutiveOverview": {
-        const [patients, admissions, occupiedBeds, totalBeds, todayPayments] = await Promise.all([
-          prisma.patient.count(),
-          prisma.admission.count({ where: { status: "ACTIVE" } }),
-          prisma.bed.count({ where: { status: "OCCUPIED" } }),
-          prisma.bed.count(),
-          prisma.payment.aggregate({ _sum: { amount: true } }),
-        ]);
-        const bedRate = totalBeds > 0 ? Math.round((occupiedBeds / totalBeds) * 100) : 0;
-        return {
-          totalRegisteredPatients: patients,
-          activeAdmissions: admissions,
-          bedOccupancy: `${occupiedBeds} / ${totalBeds} (${bedRate}%)`,
-          totalRevenueCollected: `₹${todayPayments._sum.amount || 0}`,
-        };
-      }
-      case "getLowStockAlerts": {
-        return prisma.inventoryItem.findMany({
-          where: { currentStock: { lte: 20 } },
-          select: { name: true, category: true, currentStock: true, minStockLevel: true, unit: true },
-        });
-      }
-      case "getRevenueByDepartment": {
-        return prisma.charge.groupBy({
-          by: ["sourceModule"],
-          _sum: { totalAmount: true },
-        });
-      }
-      case "getStaffOnLeave": {
-        return prisma.leaveRequest.findMany({
-          where: { status: "APPROVED" },
-          include: {
-            employee: { include: { user: { select: { firstName: true, lastName: true, role: true } }, department: true } },
-          },
-          take: 10,
-        });
-      }
-      default:
-        return { error: "Unknown tool" };
-    }
+  // Real-time Database Context Extractors
+  private static async getAdminContext() {
+    const [
+      totalPatients,
+      activeAdmissions,
+      totalBeds,
+      occupiedBeds,
+      paymentAggregate,
+      deptRevenue,
+      lowStockItems,
+      totalStaff,
+      pendingLeaves,
+    ] = await Promise.all([
+      prisma.patient.count(),
+      prisma.admission.count({ where: { status: "ACTIVE" } }),
+      prisma.bed.count(),
+      prisma.bed.count({ where: { status: "OCCUPIED" } }),
+      prisma.payment.aggregate({ _sum: { amount: true } }),
+      prisma.charge.groupBy({
+        by: ["sourceModule"],
+        _sum: { totalAmount: true },
+      }),
+      prisma.inventoryItem.findMany({
+        where: { currentStock: { lte: 20 } },
+        select: { name: true, category: true, currentStock: true, minStockLevel: true, unit: true },
+      }),
+      prisma.employee.count({ where: { employmentStatus: "ACTIVE" } }),
+      prisma.leaveRequest.count({ where: { status: "PENDING" } }),
+    ]);
+
+    const occupancyRate = totalBeds > 0 ? Math.round((occupiedBeds / totalBeds) * 100) : 0;
+    const deptRevMap = deptRevenue.reduce((acc, curr) => {
+      acc[curr.sourceModule] = curr._sum.totalAmount || 0;
+      return acc;
+    }, {} as Record<string, number>);
+
+    return {
+      hospitalName: "AegisCare Super Specialty Hospital",
+      totalRegisteredPatients: totalPatients,
+      activeAdmissions,
+      bedOccupancy: `${occupiedBeds} / ${totalBeds} (${occupancyRate}%)`,
+      bedOccupancyPercentage: occupancyRate,
+      totalRevenueCollected: paymentAggregate._sum.amount || 0,
+      departmentRevenue: deptRevMap,
+      lowStockCount: lowStockItems.length,
+      lowStockItems: lowStockItems.slice(0, 5),
+      activeStaffCount: totalStaff,
+      pendingLeaveRequests: pendingLeaves,
+    };
   }
 
-  static async handleChat(prompt: string, user: AuthUser, conversationId?: string) {
-    const userRole = user.role;
-    let toolResult: any = null;
-    let toolUsed: string | null = null;
-    let assistantReply = "";
+  private static async getHrmsContext() {
+    const [employees, pendingLeaves, approvedLeaves] = await Promise.all([
+      prisma.employee.findMany({
+        where: { employmentStatus: "ACTIVE" },
+        include: {
+          user: { select: { firstName: true, lastName: true, role: true } },
+          department: { select: { name: true } },
+        },
+      }),
+      prisma.leaveRequest.findMany({
+        where: { status: "PENDING" },
+        include: {
+          employee: { include: { user: true, department: true } },
+        },
+      }),
+      prisma.leaveRequest.findMany({
+        where: { status: "APPROVED" },
+        include: {
+          employee: { include: { user: true, department: true } },
+        },
+      }),
+    ]);
 
-    const lower = prompt.toLowerCase();
+    let totalMonthlySalaryLiability = 0;
+    const departmentSalaries: Record<string, { count: number; totalSalary: number }> = {};
+    const roleDistribution: Record<string, number> = {};
 
-    if (userRole === "PATIENT") {
-      if (!user.patientId) throw new ApiError(400, "Patient record not found.");
+    for (const emp of employees) {
+      const salary = emp.salary || 0;
+      totalMonthlySalaryLiability += salary;
 
-      if (lower.includes("appointment") || lower.includes("booking") || lower.includes("schedule") || lower.includes("doctor")) {
-        toolUsed = "getMyAppointments";
-        toolResult = await this.executePatientTool(toolUsed, user.patientId);
-        const count = toolResult.length;
-        if (count === 0) {
-          assistantReply = "You currently have no scheduled appointments. You can book an appointment with any of our department specialists directly from the Appointments section.";
-        } else {
-          const apptList = toolResult
-            .map((a: any) => {
-              const docName = a.doctor?.employee?.user
-                ? `Dr. ${a.doctor.employee.user.firstName} ${a.doctor.employee.user.lastName}`
-                : "Specialist Doctor";
-              const deptName = a.department?.name || a.doctor?.department?.name || "General OPD";
-              return `• **${new Date(a.appointmentDate).toLocaleDateString()} at ${a.timeSlot}** with ${docName} (${deptName}) — Status: **${a.status}** (Token #${a.tokenNumber})`;
-            })
-            .join("\n");
-          assistantReply = `Here are your recent and upcoming appointments:\n\n${apptList}\n\nNeed to reschedule or book a new consultation? Let me know or use the Book Appointment button.`;
-        }
-      } else if (lower.includes("medicine") || lower.includes("prescription") || lower.includes("rx") || lower.includes("drugs")) {
-        toolUsed = "getMyPrescriptions";
-        toolResult = await this.executePatientTool(toolUsed, user.patientId);
-        if (toolResult.length === 0) {
-          assistantReply = "You have no active prescriptions on file.";
-        } else {
-          const rxList = toolResult
-            .map((rx: any) => {
-              const docName = rx.doctor?.employee?.user
-                ? `Dr. ${rx.doctor.employee.user.firstName} ${rx.doctor.employee.user.lastName}`
-                : "Doctor";
-              const items = (rx.items || []).map((i: any) => `  - ${i.medicineName} (${i.dosage}, ${i.frequency} for ${i.durationDays} days)`).join("\n");
-              return `• **Prescription dated ${new Date(rx.date).toLocaleDateString()}** (${docName}) [${rx.status}]:\n${items}`;
-            })
-            .join("\n\n");
-          assistantReply = `Here are your prescribed medications:\n\n${rxList}\n\n*Note: Please consult with your pharmacist or doctor before altering dosages.*`;
-        }
-      } else if (lower.includes("report") || lower.includes("lab") || lower.includes("test") || lower.includes("result")) {
-        toolUsed = "getMyReports";
-        toolResult = await this.executePatientTool(toolUsed, user.patientId);
-        if (toolResult.length === 0) {
-          assistantReply = "No diagnostic reports found under your medical record yet.";
-        } else {
-          const repList = toolResult.map((r: any) => `• **${r.title}** (${r.type}) — Date: ${new Date(r.reportDate).toLocaleDateString()}`).join("\n");
-          assistantReply = `Here are your available medical reports:\n\n${repList}\n\nAll verified diagnostic reports can be downloaded in the Reports tab.`;
-        }
-      } else if (lower.includes("bill") || lower.includes("invoice") || lower.includes("payment") || lower.includes("cost") || lower.includes("fee")) {
-        toolUsed = "getMyBills";
-        toolResult = await this.executePatientTool(toolUsed, user.patientId);
-        if (toolResult.length === 0) {
-          assistantReply = "You have no pending hospital invoices or outstanding billing statements.";
-        } else {
-          const billList = toolResult.map((b: any) => `• Invoice **#${b.invoiceNumber}**: Total ₹${b.finalAmount} | Paid: ₹${b.paidAmount} | Balance: **₹${b.balanceAmount}** [Status: ${b.status}]`).join("\n");
-          assistantReply = `Here is your billing summary:\n\n${billList}\n\nYou can view the full itemized invoices and receipt history under the Bills & Payments section.`;
-        }
-      } else if (lower.includes("emergency") || lower.includes("chest pain") || lower.includes("severe") || lower.includes("bleeding") || lower.includes("breath")) {
-        assistantReply = "⚠️ **EMERGENCY WARNING**: If you are experiencing severe symptoms such as acute chest pain, shortness of breath, heavy bleeding, or loss of consciousness, please **call emergency services immediately (911/112)** or visit our 24/7 Emergency Trauma Center. Do not rely on AI for critical medical emergencies.";
-      } else {
-        toolUsed = "getHospitalTimings";
-        toolResult = await this.executePatientTool(toolUsed, user.patientId);
-        assistantReply = `Welcome to **${toolResult.hospitalName}** Patient AI Assistant!\n\nI can help you with:\n- Viewing your upcoming appointments\n- Reviewing your medication prescriptions\n- Checking lab results and diagnostic reports\n- Checking outstanding bills and receipts\n- General hospital timings and visiting hours (${toolResult.opdTimings})\n\nHow may I assist your care journey today?`;
+      const dept = emp.department?.name || "General";
+      if (!departmentSalaries[dept]) {
+        departmentSalaries[dept] = { count: 0, totalSalary: 0 };
       }
-    } else {
-      // ADMIN & Staff Copilot
-      if (lower.includes("revenue") || lower.includes("income") || lower.includes("collection") || lower.includes("finance")) {
-        toolUsed = "getRevenueByDepartment";
-        toolResult = await this.executeAdminTool(toolUsed);
-        const revList = toolResult.map((r: any) => `• **${r.sourceModule}**: ₹${(r._sum?.totalAmount || 0).toLocaleString()}`).join("\n");
-        assistantReply = `📊 **Revenue Breakdown by Department**:\n\n${revList}\n\nTotal collections are monitored live across OPD, Pharmacy, IPD, and Laboratory modules.`;
-      } else if (lower.includes("bed") || lower.includes("occupancy") || lower.includes("admit") || lower.includes("ward")) {
-        toolUsed = "getExecutiveOverview";
-        toolResult = await this.executeAdminTool(toolUsed);
-        assistantReply = `🏥 **Inpatient & Bed Operations Summary**:\n\n• **Active Admissions**: ${toolResult.activeAdmissions} patients\n• **Bed Occupancy**: ${toolResult.bedOccupancy}\n• **Total Registered Patients**: ${toolResult.totalRegisteredPatients}\n\nReal-time ward telemetry indicates optimal capacity across General, ICU, and Semi-Private units.`;
-      } else if (lower.includes("stock") || lower.includes("inventory") || lower.includes("shortage") || lower.includes("supply")) {
-        toolUsed = "getLowStockAlerts";
-        toolResult = await this.executeAdminTool(toolUsed);
-        if (toolResult.length === 0) {
-          assistantReply = "✅ All inventory items and essential pharmaceuticals are above reorder thresholds.";
-        } else {
-          const stockList = toolResult.map((i: any) => `• **${i.name}** (${i.category}): Current Stock = **${i.currentStock} ${i.unit}** (Min: ${i.minStockLevel})`).join("\n");
-          assistantReply = `⚠️ **Low Stock Critical Alerts (${toolResult.length} items)**:\n\n${stockList}\n\nPurchase requisitions should be initiated for the above flagged items.`;
-        }
-      } else if (lower.includes("staff") || lower.includes("leave") || lower.includes("doctor") || lower.includes("nurse") || lower.includes("employee")) {
-        toolUsed = "getStaffOnLeave";
-        toolResult = await this.executeAdminTool(toolUsed);
-        if (toolResult.length === 0) {
-          assistantReply = "No staff members are currently on approved leave today. Department roster is fully staffed.";
-        } else {
-          const leaveList = toolResult.map((l: any) => `• **${l.employee?.user?.firstName || "Staff"} ${l.employee?.user?.lastName || ""}** (${l.employee?.department?.name || "General"} - ${l.leaveType} Leave) until ${new Date(l.endDate).toLocaleDateString()}`).join("\n");
-          assistantReply = `📋 **Staff On Approved Leave**:\n\n${leaveList}`;
-        }
+      departmentSalaries[dept].count += 1;
+      departmentSalaries[dept].totalSalary += salary;
+
+      const role = emp.user?.role || "STAFF";
+      roleDistribution[role] = (roleDistribution[role] || 0) + 1;
+    }
+
+    return {
+      totalActiveEmployees: employees.length,
+      totalMonthlySalaryLiability,
+      averageMonthlySalary: employees.length > 0 ? Math.round(totalMonthlySalaryLiability / employees.length) : 0,
+      departmentSalaries,
+      roleDistribution,
+      pendingLeaveRequestsCount: pendingLeaves.length,
+      pendingLeaveRequests: pendingLeaves.map((l) => ({
+        employeeName: `${l.employee.user.firstName} ${l.employee.user.lastName}`,
+        role: l.employee.user.role,
+        department: l.employee.department.name,
+        leaveType: l.leaveType,
+        days: Math.ceil((new Date(l.endDate).getTime() - new Date(l.startDate).getTime()) / (1000 * 3600 * 24)) + 1,
+        reason: l.reason,
+      })),
+      staffOnLeaveTodayCount: approvedLeaves.length,
+      staffOnLeaveToday: approvedLeaves.map((l) => ({
+        employeeName: `${l.employee.user.firstName} ${l.employee.user.lastName}`,
+        department: l.employee.department.name,
+        leaveType: l.leaveType,
+        until: new Date(l.endDate).toLocaleDateString(),
+      })),
+    };
+  }
+
+  private static async getDoctorContext(user: AuthUser) {
+    const [admissions, appointments, labOrders] = await Promise.all([
+      prisma.admission.findMany({
+        where: { status: "ACTIVE" },
+        include: {
+          patient: true,
+          bed: { include: { ward: true } },
+          doctor: { include: { employee: { include: { user: true } } } },
+          dietPlans: { where: { status: "ACTIVE" } },
+        },
+      }),
+      prisma.appointment.findMany({
+        where: { status: { in: ["SCHEDULED", "CONFIRMED"] } },
+        include: {
+          patient: true,
+          doctor: { include: { employee: { include: { user: true } } } },
+          department: true,
+        },
+        orderBy: { appointmentDate: "asc" },
+        take: 10,
+      }),
+      prisma.labOrder.findMany({
+        where: { status: { in: ["ORDERED", "SAMPLE_COLLECTED", "PROCESSING"] } },
+        include: {
+          patient: true,
+          items: { include: { labTest: true } },
+        },
+        take: 10,
+      }),
+    ]);
+
+    return {
+      activeInpatientCount: admissions.length,
+      admittedInpatients: admissions.map((a) => {
+        const age = a.patient.dob ? new Date().getFullYear() - new Date(a.patient.dob).getFullYear() : "N/A";
+        return {
+          uhid: a.patient.uhid,
+          patientName: `${a.patient.firstName} ${a.patient.lastName}`,
+          age,
+          gender: a.patient.gender,
+          ward: a.bed?.ward?.name || "General",
+          bed: a.bed?.bedNumber || "Unassigned",
+          admissionDate: new Date(a.admissionDate).toLocaleDateString(),
+          allergies: a.patient.allergies || "None",
+          activeDietPlan: a.dietPlans[0]?.dietType || "NORMAL",
+          attendingDoctor: a.doctor?.employee?.user
+            ? `Dr. ${a.doctor.employee.user.firstName} ${a.doctor.employee.user.lastName}`
+            : "Specialist",
+        };
+      }),
+      upcomingAppointmentsCount: appointments.length,
+      upcomingAppointments: appointments.map((appt) => ({
+        token: appt.tokenNumber,
+        patientName: `${appt.patient.firstName} ${appt.patient.lastName}`,
+        timeSlot: appt.timeSlot,
+        date: new Date(appt.appointmentDate).toLocaleDateString(),
+        status: appt.status,
+      })),
+      pendingLabOrdersCount: labOrders.length,
+      pendingLabOrders: labOrders.map((lo) => ({
+        testNames: lo.items.map((i) => i.testName || i.labTest?.name).join(", "),
+        patientName: `${lo.patient.firstName} ${lo.patient.lastName}`,
+        status: lo.status,
+        orderDate: new Date(lo.orderDate).toLocaleDateString(),
+      })),
+    };
+  }
+
+  private static async getFinanceContext() {
+    const [invoices, payments, chargesByDept] = await Promise.all([
+      prisma.invoice.findMany({
+        select: {
+          subtotal: true,
+          discountAmount: true,
+          finalAmount: true,
+          paidAmount: true,
+          balanceAmount: true,
+          status: true,
+        },
+      }),
+      prisma.payment.findMany({
+        select: {
+          amount: true,
+          paymentMethod: true,
+          createdAt: true,
+        },
+      }),
+      prisma.charge.groupBy({
+        by: ["sourceModule"],
+        _sum: { totalAmount: true },
+      }),
+    ]);
+
+    let totalBilled = 0;
+    let totalCollected = 0;
+    let totalOutstandingReceivables = 0;
+    const invoiceStatusCount: Record<string, number> = {};
+
+    for (const inv of invoices) {
+      totalBilled += inv.finalAmount;
+      totalCollected += inv.paidAmount;
+      totalOutstandingReceivables += inv.balanceAmount;
+      invoiceStatusCount[inv.status] = (invoiceStatusCount[inv.status] || 0) + 1;
+    }
+
+    const paymentMethodTotals: Record<string, number> = {};
+    for (const p of payments) {
+      paymentMethodTotals[p.paymentMethod] = (paymentMethodTotals[p.paymentMethod] || 0) + p.amount;
+    }
+
+    const deptRevenueMap: Record<string, number> = {};
+    for (const c of chargesByDept) {
+      deptRevenueMap[c.sourceModule] = c._sum.totalAmount || 0;
+    }
+
+    return {
+      totalInvoicesCount: invoices.length,
+      totalBilled,
+      totalCollected,
+      totalOutstandingReceivables,
+      collectionRate: totalBilled > 0 ? Math.round((totalCollected / totalBilled) * 100) : 0,
+      invoiceStatusCount,
+      paymentMethodTotals,
+      departmentRevenue: deptRevenueMap,
+    };
+  }
+
+  // Role-specific Gemini AI Executive Summary Generator
+  static async getRoleExecutiveSummary(role: string, user: AuthUser) {
+    let systemInstruction = "";
+    let rawMetrics: any = {};
+    let promptTitle = "";
+
+    switch (role.toUpperCase()) {
+      case "ADMIN": {
+        rawMetrics = await this.getAdminContext();
+        systemInstruction =
+          "You are the Chief Hospital Operations Executive AI for AegisCare Super Specialty Hospital. Generate an authoritative, professional Executive Hospital Operations and Income Summary for the Hospital Board and Medical Director. Break down hospital income across all departments (IPD, OPD, Pharmacy, Lab), bed occupancy rates, patient throughput, low-stock inventory alerts, and actionable next-shift recommendations. Format with clean Markdown headers, summary tables, and bullet points.";
+        promptTitle = "Executive Hospital Operations & Income Summary";
+        break;
+      }
+      case "HRMS": {
+        rawMetrics = await this.getHrmsContext();
+        systemInstruction =
+          "You are the Hospital Human Resources & Payroll Intelligence Advisor for AegisCare Super Specialty Hospital. Generate an executive Payroll & Workforce Briefing. Detail the exact total monthly salary liability to be paid (in Indian Rupees ₹), department-wise payroll allocation, active employee counts across clinical and non-clinical roles, pending leave approvals requiring HR action, and staff currently on approved leave. Format with clean Markdown headers, financial summary tables, and HR action items.";
+        promptTitle = "HRMS Payroll Liability & Workforce Summary";
+        break;
+      }
+      case "DOCTOR": {
+        rawMetrics = await this.getDoctorContext(user);
+        systemInstruction =
+          "You are the Senior Clinical Intelligence Assistant for AegisCare Super Specialty Hospital. Generate a comprehensive Clinical & Inpatient Care Briefing for attending physicians and medical officers. Summarize the active inpatient census, high-risk patient flags (allergies, diet prescriptions), pending urgent laboratory orders, and scheduled OPD consultations. Format with clean Markdown headers, patient status tables, and clinical priority bullet points.";
+        promptTitle = "Physician Clinical & Inpatient Overview";
+        break;
+      }
+      case "FINANCE": {
+        rawMetrics = await this.getFinanceContext();
+        systemInstruction =
+          "You are the Chief Financial Controller AI for AegisCare Super Specialty Hospital. Generate a comprehensive Financial Health, Revenue Realization, and Receivables Audit. Detail total billed revenue, collected cashflows, outstanding patient receivables, payment method breakdown (Cash, Card, UPI, Insurance), and departmental income contributions. Format with clean Markdown headers, financial summary tables, and revenue optimization recommendations.";
+        promptTitle = "Financial Controller Revenue & Receivables Audit";
+        break;
+      }
+      default: {
+        rawMetrics = await this.getAdminContext();
+        systemInstruction =
+          "You are the Executive Hospital AI Advisor for AegisCare Super Specialty Hospital. Generate a high-level operational overview covering hospital capacity, financial performance, and clinical workflows.";
+        promptTitle = "Executive Hospital Overview";
+        break;
+      }
+    }
+
+    const userPrompt = `Generate the ${promptTitle} based on the following real-time database telemetry:\n\n${JSON.stringify(rawMetrics, null, 2)}`;
+
+    let aiSummary = "";
+    try {
+      aiSummary = await this.callGemini(systemInstruction, userPrompt);
+    } catch (err: any) {
+      console.warn("Gemini API call failed, generating deterministic executive summary:", err.message);
+      if (role === "ADMIN") {
+        aiSummary = `### 🏥 Executive Hospital Operations & Income Summary\n\n- **Total Revenue Collected**: ₹${rawMetrics.totalRevenueCollected.toLocaleString()}\n- **Bed Occupancy**: ${rawMetrics.bedOccupancy}\n- **Active Inpatient Admissions**: ${rawMetrics.activeAdmissions}\n- **Total Registered Patients**: ${rawMetrics.totalRegisteredPatients}\n- **Critical Stock Alerts**: ${rawMetrics.lowStockCount} items low in inventory.\n\n*Live system telemetry synced from AegisCare Core Operations.*`;
+      } else if (role === "HRMS") {
+        aiSummary = `### 👥 HRMS Payroll & Workforce Intelligence Summary\n\n- **Total Monthly Salary Liability To Be Paid**: ₹${rawMetrics.totalMonthlySalaryLiability.toLocaleString()}\n- **Total Active Staff Count**: ${rawMetrics.totalActiveEmployees} employees\n- **Average Monthly Salary**: ₹${rawMetrics.averageMonthlySalary.toLocaleString()}\n- **Pending Leave Requests Requiring Action**: ${rawMetrics.pendingLeaveRequestsCount}\n- **Staff on Approved Leave Today**: ${rawMetrics.staffOnLeaveTodayCount}`;
+      } else if (role === "FINANCE") {
+        aiSummary = `### 💰 Financial Audit & Revenue Realization Summary\n\n- **Total Invoiced / Billed**: ₹${rawMetrics.totalBilled.toLocaleString()}\n- **Total Revenue Collected**: ₹${rawMetrics.totalCollected.toLocaleString()} (${rawMetrics.collectionRate}% Collection Rate)\n- **Outstanding Patient Receivables**: ₹${rawMetrics.totalOutstandingReceivables.toLocaleString()}`;
       } else {
-        toolUsed = "getExecutiveOverview";
-        toolResult = await this.executeAdminTool(toolUsed);
-        assistantReply = `🤖 **AegisCare Hospital Executive AI Copilot**\n\n**Current System Health Overview**:\n• Total Registered Patients: **${toolResult.totalRegisteredPatients}**\n• Active Inpatient Admissions: **${toolResult.activeAdmissions}**\n• Bed Occupancy: **${toolResult.bedOccupancy}**\n• Total Revenue Collected: **${toolResult.totalRevenueCollected}**\n\nAsk me queries such as:\n- "What is today's revenue breakdown?"\n- "Which medicines are low in stock?"\n- "How many beds are currently occupied?"\n- "Who is currently on leave?"`;
+        aiSummary = `### 👨‍⚕️ Clinical Care & Inpatient Summary\n\n- **Active Inpatients Under Care**: ${rawMetrics.activeInpatientCount}\n- **Upcoming Consultations**: ${rawMetrics.upcomingAppointmentsCount}\n- **Pending Laboratory Investigations**: ${rawMetrics.pendingLabOrdersCount}`;
       }
     }
 
     return {
-      reply: assistantReply,
-      toolUsed,
-      toolData: toolResult,
+      title: promptTitle,
+      summary: aiSummary,
+      metrics: rawMetrics,
+      generatedAt: new Date().toISOString(),
     };
+  }
+
+  // Conversational AI Chat Copilot
+  static async handleChat(prompt: string, user: AuthUser, conversationId?: string) {
+    const userRole = user.role;
+    let roleContext: any = null;
+
+    if (userRole === "PATIENT") {
+      if (user.patientId) {
+        const [appts, rxs, reports, bills] = await Promise.all([
+          prisma.appointment.findMany({ where: { patientId: user.patientId }, include: { doctor: { include: { employee: { include: { user: true } } } }, department: true }, take: 5 }),
+          prisma.prescription.findMany({ where: { patientId: user.patientId }, include: { items: true }, take: 5 }),
+          prisma.medicalReport.findMany({ where: { patientId: user.patientId }, take: 5 }),
+          prisma.invoice.findMany({ where: { patientId: user.patientId }, take: 5 }),
+        ]);
+        roleContext = { appointments: appts, prescriptions: rxs, reports, invoices: bills };
+      }
+    } else if (userRole === "HRMS") {
+      roleContext = await this.getHrmsContext();
+    } else if (userRole === "DOCTOR" || userRole === "NURSE") {
+      roleContext = await this.getDoctorContext(user);
+    } else if (userRole === "FINANCE") {
+      roleContext = await this.getFinanceContext();
+    } else {
+      roleContext = await this.getAdminContext();
+    }
+
+    const systemInstruction = `You are AegisCare AI, the intelligent hospital assistant for AegisCare Super Specialty Hospital.
+The current user is authenticated with Role: ${userRole} (Name: ${user.firstName} ${user.lastName}).
+You have direct access to the real-time hospital database context provided below.
+Answer user questions accurately, professionally, concisely, and supportively using the real-time context.
+For medical emergency questions from patients, always include an urgent safety disclaimer advising immediate emergency care (911/112).
+Format responses with clean Markdown.`;
+
+    const userQuery = `Current Live Hospital Context:\n${JSON.stringify(roleContext, null, 2)}\n\nUser Question:\n${prompt}`;
+
+    try {
+      const geminiReply = await this.callGemini(systemInstruction, userQuery);
+      return {
+        reply: geminiReply,
+        toolUsed: "Gemini 3.6 Flash",
+        toolData: roleContext,
+      };
+    } catch (err: any) {
+      console.warn("Fallback to local rules due to Gemini error:", err.message);
+      return {
+        reply: `Here is the current summary based on live hospital records:\n\n${JSON.stringify(roleContext, null, 2)}`,
+        toolUsed: "Local Database Telemetry",
+        toolData: roleContext,
+      };
+    }
   }
 }

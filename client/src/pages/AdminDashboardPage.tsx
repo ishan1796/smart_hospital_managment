@@ -18,6 +18,7 @@ import {
   TrendingUp,
   Bot
 } from "lucide-react";
+import { AiExecutiveSummaryBanner } from "../components/common/AiExecutiveSummaryBanner";
 import {
   ResponsiveContainer,
   BarChart,
@@ -142,9 +143,13 @@ export const AdminDashboardPage: React.FC = () => {
         </div>
       </div>
 
-      {/* KPI Cards Grid */}
+      {/* Overview Analytics Tab */}
       {activeTab === "overview" && (
         <>
+          {/* Gemini AI Executive Summary Banner */}
+          <AiExecutiveSummaryBanner role="ADMIN" />
+
+          {/* Quick KPI Stat Cards */}
           <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
             {statCards.map((s, idx) => (
               <div key={idx} className="bg-white rounded-2xl p-5 border border-slate-200/80 shadow-xs flex flex-col justify-between">

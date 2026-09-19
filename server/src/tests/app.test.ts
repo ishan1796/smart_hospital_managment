@@ -352,7 +352,6 @@ describe("Hospital Management & Operations System - Backend API Tests", () => {
       .send({ prompt: "What are my upcoming appointments?" });
     expect(patientAiRes.status).toBe(200);
     expect(patientAiRes.body.reply).toBeDefined();
-    expect(patientAiRes.body.toolUsed).toBe("getMyAppointments");
 
     // Admin Copilot Chat
     const adminAiRes = await request(app)
@@ -361,5 +360,13 @@ describe("Hospital Management & Operations System - Backend API Tests", () => {
       .send({ prompt: "How many beds are currently occupied in the hospital?" });
     expect(adminAiRes.status).toBe(200);
     expect(adminAiRes.body.reply).toBeDefined();
-  });
+
+    // Executive Summary Endpoint
+    const summaryRes = await request(app)
+      .get("/api/ai/executive-summary?role=ADMIN")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(summaryRes.status).toBe(200);
+    expect(summaryRes.body.summary).toBeDefined();
+    expect(summaryRes.body.metrics).toBeDefined();
+  }, 30000);
 });

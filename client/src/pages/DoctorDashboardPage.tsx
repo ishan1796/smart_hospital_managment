@@ -25,6 +25,7 @@ import {
   Eye,
   AlertCircle
 } from "lucide-react";
+import { AiExecutiveSummaryBanner } from "../components/common/AiExecutiveSummaryBanner";
 
 export const DoctorDashboardPage: React.FC = () => {
   const { user } = useAuth();
@@ -334,6 +335,9 @@ export const DoctorDashboardPage: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* Gemini AI Clinical Intelligence Briefing */}
+      <AiExecutiveSummaryBanner role="DOCTOR" />
 
       {/* ========================================================= */}
       {/* 1. OPD CONSULTATION QUEUE VIEW */}
